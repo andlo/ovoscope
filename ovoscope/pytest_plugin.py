@@ -52,6 +52,8 @@ from typing import TYPE_CHECKING, Iterator, List, Optional, Union
 if TYPE_CHECKING:
     from ovoscope.bus_coverage import BusCoverageReport
 
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -421,6 +423,31 @@ def _autodiscover_intent_cases(config):
     return None
 
 
+def _forget_failed_module(module_path) -> None:
+    """Drop a module whose import just failed from ``sys.modules``.
+
+    Only the module at *module_path* is dropped, by comparing ``__file__``
+    rather than guessing the name pytest derived for it: under
+    ``--import-mode=importlib`` that name depends on the rootdir and on
+    ``consider_namespace_packages``, and a wrong guess would silently do
+    nothing. Whatever else the failed import managed to load is left alone;
+    those modules are in the same state they would be in under prepend mode.
+    """
+    try:
+        target = os.path.realpath(str(module_path))
+    except Exception:  # noqa: BLE001 - a path that cannot be resolved
+        return
+    for name, module in list(sys.modules.items()):
+        filename = getattr(module, "__file__", None)
+        if not filename:
+            continue
+        try:
+            if os.path.realpath(filename) == target:
+                del sys.modules[name]
+        except Exception:  # noqa: BLE001 - a module with an odd __file__
+            continue
+
+
 @pytest.hookimpl(wrapper=True)
 def pytest_pycollect_makemodule(module_path, parent):
     """Auto-register intent-case tests on shim modules that declare
@@ -456,6 +483,20 @@ def pytest_pycollect_makemodule(module_path, parent):
         # it (and any other import-time failure) here and let pytest's own
         # protected collection call re-import the module later, where it
         # is reported as a normal per-module skip or error instead.
+        #
+        # That re-import has to be made possible again, or the swallow
+        # turns an import failure into an ABSENCE. Measured on pytest
+        # 9.1.1: under the default prepend mode a failed import leaves
+        # nothing in ``sys.modules``, so the next access raises the same
+        # error and pytest reports it; under ``--import-mode=importlib``
+        # the half-executed module STAYS in ``sys.modules``, so the next
+        # access returns that corpse instead - a module object carrying no
+        # test functions, because execution stopped at the failing line.
+        # The collector then yields no items, pytest prints no error and
+        # exits 0. This hook is the first thing to touch ``collector.obj``,
+        # so it consumes the one attempt that ever raises.
+        # Dropping the corpse restores the premise above for both modes.
+        _forget_failed_module(module_path)
         return collector
     if not hasattr(mod, "ovoscope_intent_cases"):
         return collector
